@@ -1,0 +1,17 @@
+# Virtual Environment
+venv/
+
+# Data and Models (Too large for GitHub)
+data/
+models/
+
+# Outputs and Logs
+outputs/
+logs/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# OS Files
+.DS_Store
