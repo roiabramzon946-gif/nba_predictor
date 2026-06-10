@@ -12,8 +12,8 @@ Usage:
 """
 
 import os
-import warnings
 import argparse
+import warnings
 from datetime import date, datetime
 
 import numpy as np
@@ -50,9 +50,12 @@ def get_todays_games(game_date: date) -> pd.DataFrame:
     """
     date_str = game_date.strftime("%m/%d/%Y")
     print(f"Fetching schedule for {date_str} …")
+    
+    # השתקת האזהרה הלא-רלוונטית של nba_api
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=DeprecationWarning)
         board = scoreboardv2.ScoreboardV2(game_date=date_str, league_id="00")
+        
     games_df = board.get_data_frames()[0]  # GameHeader
 
     if games_df.empty:
@@ -93,7 +96,24 @@ def predict_games(games: pd.DataFrame, game_date: date) -> pd.DataFrame:
     historical = pd.read_csv(GAMES_FILE, parse_dates=["GAME_DATE"])
 
     rows = []
+    actual_winners = []
+
     for _, game in games.iterrows():
+        # --- מציאת המנצחת בפועל (אם המשחק כבר התקיים ונמצא בהיסטוריה) ---
+        hist_game = historical[historical["GAME_ID"].astype(int) == int(game["GAME_ID"])]
+        if not hist_game.empty:
+            home_row = hist_game[hist_game["TEAM_ID"] == int(game["HOME_TEAM_ID"])]
+            if not home_row.empty and pd.notna(home_row.iloc[0]["WL"]):
+                if home_row.iloc[0]["WL"] == "W":
+                    actual_winners.append(game["HOME_TEAM_NAME"])
+                else:
+                    actual_winners.append(game["AWAY_TEAM_NAME"])
+            else:
+                actual_winners.append("Pending")
+        else:
+            actual_winners.append("Pending")
+        # -----------------------------------------------------------------
+
         feat_row = build_prediction_row(
             home_team_id=int(game["HOME_TEAM_ID"]),
             away_team_id=int(game["AWAY_TEAM_ID"]),
@@ -123,6 +143,7 @@ def predict_games(games: pd.DataFrame, game_date: date) -> pd.DataFrame:
         np.round(ensemble_probs * 100, 1),
         np.round((1 - ensemble_probs) * 100, 1),
     )
+    games["actual_winner"] = actual_winners
     return games
 
 
@@ -161,12 +182,23 @@ def build_html(predictions: pd.DataFrame, game_date: date) -> str:
         home = row["HOME_TEAM_NAME"]
         away = row["AWAY_TEAM_NAME"]
         winner = row["predicted_winner"]
+        actual = row["actual_winner"]
         home_is_fav = row["ensemble_home_prob"] >= 50
 
         lr_h = row["lr_home_prob"]
         rf_h = row["rf_home_prob"]
         ens_h = row["ensemble_home_prob"]
         conf = row["confidence"]
+
+        # --- יצירת תווית "התוצאה בפועל" ---
+        result_html = ""
+        if actual != "Pending":
+            is_correct = (winner == actual)
+            if is_correct:
+                result_html = f'<div class="actual-result correct">✅ <strong>Correct Prediction!</strong> Actual Winner: {actual}</div>'
+            else:
+                result_html = f'<div class="actual-result incorrect">❌ <strong>Incorrect.</strong> Actual Winner: {actual}</div>'
+        # ----------------------------------
 
         cards_html += f"""
         <div class="card">
@@ -187,6 +219,8 @@ def build_html(predictions: pd.DataFrame, game_date: date) -> str:
                 <span class="pick-team">{winner}</span>
                 {_confidence_badge(conf)}
             </div>
+            
+            {result_html}
 
             <div class="models-section">
                 <div class="model-row">
@@ -287,11 +321,30 @@ def build_html(predictions: pd.DataFrame, game_date: date) -> str:
     display: flex;
     align-items: center;
     gap: 10px;
-    margin-bottom: 18px;
+    margin-bottom: 12px;
     flex-wrap: wrap;
   }}
   .pick-label {{ color: #8b949e; font-size: 0.85rem; }}
   .pick-team {{ font-weight: 700; color: #58a6ff; font-size: 1rem; }}
+
+  .actual-result {{
+    margin-top: 4px;
+    margin-bottom: 16px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    text-align: left;
+  }}
+  .actual-result.correct {{
+    background: rgba(35,134,54,0.1);
+    border: 1px solid #238636;
+    color: #e6edf3;
+  }}
+  .actual-result.incorrect {{
+    background: rgba(200,16,46,0.1);
+    border: 1px solid #c8102e;
+    color: #e6edf3;
+  }}
 
   .badge {{
     display: inline-block;
