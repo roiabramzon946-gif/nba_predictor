@@ -17,7 +17,7 @@ from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
-from nba_api.stats.endpoints import scoreboardv2
+from nba_api.stats.endpoints import scoreboardv3
 from nba_api.stats.static import teams as nba_teams_static
 
 from fetch_data import fetch_all_seasons, GAMES_FILE
@@ -49,7 +49,7 @@ def get_todays_games(game_date: date) -> pd.DataFrame:
     """
     date_str = game_date.strftime("%m/%d/%Y")
     print(f"Fetching schedule for {date_str} …")
-    board = scoreboardv2.ScoreboardV2(game_date=date_str, league_id="00")
+    board = scoreboardv3.ScoreboardV3(game_date=date_str, league_id="00")
     games_df = board.get_data_frames()[0]  # GameHeader
 
     if games_df.empty:
