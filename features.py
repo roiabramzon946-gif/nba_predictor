@@ -16,6 +16,8 @@ Each row in the output represents ONE game from the HOME team's perspective:
         - form5_diff       : home_form5 − away_form5
         - home_h2h         : home team's win rate vs THIS away team (all-time in data)
         - away_h2h         : away team's win rate vs THIS home team (= 1 − home_h2h)
+        - home_rest_days   : home team's rest days before this game (0 for B2B, max 7)
+        - away_rest_days   : away team's rest days before this game (0 for B2B, max 7)
         - season_weight    : recency weight used during training (not a model feature)
 
 Usage:
@@ -38,6 +40,8 @@ FEATURE_COLS = [
     "form5_diff",
     "home_h2h",
     "away_h2h",
+    "home_rest_days",
+    "away_rest_days",
 ]
 
 # Map season string → numeric recency weight (oldest = 1, newest = 6)
@@ -61,11 +65,6 @@ SEASON_WEIGHTS = _build_season_weights(num_seasons=6)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _rolling_win_pct(team_games: pd.DataFrame) -> pd.Series:
-    """
-    For a single team's games (sorted by date), compute cumulative win%
-    BEFORE each game. The very first game gets 0.5 as a prior.
-    Returns a Series indexed like team_games.
-    """
     wins = team_games["WL_binary"].values
     cum_wins = np.concatenate([[0], np.cumsum(wins[:-1])])
     cum_games = np.arange(len(wins))
@@ -76,19 +75,18 @@ def _rolling_win_pct(team_games: pd.DataFrame) -> pd.Series:
 
 
 def _rolling_form5(team_games: pd.DataFrame) -> pd.Series:
-    """
-    Win rate in the last 5 games BEFORE each game.
-    Optimized via pandas vectorization.
-    """
     form = team_games["WL_binary"].shift(1).rolling(window=5, min_periods=1).mean()
     return form.fillna(0.5)
 
 
+def _calculate_rest_days(team_games: pd.DataFrame) -> pd.Series:
+    diff_days = (team_games["GAME_DATE"] - team_games["GAME_DATE"].shift(1)).dt.days
+    rest_days = diff_days - 1
+    rest_days = rest_days.fillna(3)
+    return rest_days.clip(lower=0, upper=7)
+
+
 def _h2h_win_rate(games_df: pd.DataFrame) -> pd.Series:
-    """
-    For each row (a paired home vs away game), look at ALL earlier meetings
-    between the same pair and return the home team's historical win rate.
-    """
     h2h = []
     records: dict = {}
 
@@ -106,7 +104,6 @@ def _h2h_win_rate(games_df: pd.DataFrame) -> pd.Series:
             combined_home_wins = wins + (rev_total - rev_wins)
             h2h.append(combined_home_wins / combined_total)
 
-        # Update record for this game
         records[key] = [wins + int(row["home_win"]), total + 1]
 
     return pd.Series(h2h, index=games_df.index)
@@ -117,9 +114,6 @@ def _h2h_win_rate(games_df: pd.DataFrame) -> pd.Series:
 def build_feature_matrix(
     raw_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """
-    Build model-ready features from raw nba_api game logs.
-    """
     df = raw_df.copy()
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     df["WL_binary"] = (df["WL"] == "W").astype(int)
@@ -129,63 +123,61 @@ def build_feature_matrix(
 
     df = df.sort_values("GAME_DATE").reset_index(drop=True)
 
-    # ── Per-team rolling stats ────────────────────────────────────────────────
     win_pct_map: dict = {}
     form5_map: dict = {}
+    rest_days_map: dict = {}
 
-    # 1. WIN PERCENTAGE: Grouped by BOTH Team and Season (Resets every season)
     for (team_id, season), group in df.groupby(["TEAM_ID", "SEASON"]):
         group_sorted = group.sort_values("GAME_DATE")
         wp = _rolling_win_pct(group_sorted)
         for idx, w in zip(group_sorted.index, wp):
             win_pct_map[idx] = w
 
-    # 2. FORM (Last 5 Games): Grouped by Team only (Carries over between seasons)
     for team_id, group in df.groupby("TEAM_ID"):
         group_sorted = group.sort_values("GAME_DATE")
         f5 = _rolling_form5(group_sorted)
+        rd = _calculate_rest_days(group_sorted)
         for idx, f in zip(group_sorted.index, f5):
             form5_map[idx] = f
+        for idx, r in zip(group_sorted.index, rd):
+            rest_days_map[idx] = r
 
     df["win_pct_before"] = df.index.map(win_pct_map)
     df["form5"] = df.index.map(form5_map)
+    df["rest_days_before"] = df.index.map(rest_days_map)
 
-    # ── Pair home and away rows by GAME_ID ───────────────────────────────────
     home = df[df["is_home"] == 1][[
         "GAME_ID", "TEAM_ID", "GAME_DATE", "SEASON", "month",
-        "WL_binary", "win_pct_before", "form5",
+        "WL_binary", "win_pct_before", "form5", "rest_days_before"
     ]].rename(columns={
         "TEAM_ID": "home_team_id",
         "WL_binary": "home_win",
         "win_pct_before": "home_win_pct",
         "form5": "home_form5",
+        "rest_days_before": "home_rest_days",
     })
 
     away = df[df["is_home"] == 0][[
         "GAME_ID", "TEAM_ID",
-        "WL_binary", "win_pct_before", "form5",
+        "WL_binary", "win_pct_before", "form5", "rest_days_before"
     ]].rename(columns={
         "TEAM_ID": "away_team_id",
         "WL_binary": "away_win",
         "win_pct_before": "away_win_pct",
         "form5": "away_form5",
+        "rest_days_before": "away_rest_days",
     })
 
     paired = home.merge(away, on="GAME_ID").sort_values("GAME_DATE").reset_index(drop=True)
-
-    # Sanity: home_win should be complement of away_win
     paired = paired[paired["home_win"] + paired["away_win"] == 1].copy()
 
-    # ── Head-to-head ─────────────────────────────────────────────────────────
     paired["home_h2h"] = _h2h_win_rate(paired)
     paired["away_h2h"] = 1.0 - paired["home_h2h"]
 
-    # ── Derived diffs ─────────────────────────────────────────────────────────
     paired["win_pct_diff"] = paired["home_win_pct"] - paired["away_win_pct"]
     paired["form5_diff"] = paired["home_form5"] - paired["away_form5"]
     paired["home_advantage"] = 1
 
-    # ── Season recency weight ─────────────────────────────────────────────────
     paired["season_weight"] = paired["SEASON"].map(SEASON_WEIGHTS).fillna(1)
 
     X = paired[FEATURE_COLS].astype(float)
@@ -202,10 +194,6 @@ def build_prediction_row(
     game_date,
     historical_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Build a single feature row for an UPCOMING game (no result yet).
-    """
-    # Normalize timestamps to safely align types
     game_date = pd.Timestamp(game_date).normalize()
     month = game_date.month
 
@@ -213,7 +201,7 @@ def build_prediction_row(
     hist_df["GAME_DATE"] = pd.to_datetime(hist_df["GAME_DATE"]).dt.normalize()
     hist_df["WL_binary"] = (hist_df["WL"] == "W").astype(int)
 
-    # ── Home team rolling stats ───────────────────────────────────────────────
+    # ── Home team stats ───────────────────────────────────────────────────────
     home_hist = hist_df[hist_df["TEAM_ID"] == home_team_id].sort_values("GAME_DATE")
     home_hist = home_hist[home_hist["GAME_DATE"] < game_date]
 
@@ -222,8 +210,16 @@ def build_prediction_row(
     
     home_win_pct = float(home_season_games["WL_binary"].mean()) if len(home_season_games) > 0 else 0.5
     home_form5 = float(home_hist["WL_binary"].tail(5).mean()) if len(home_hist) > 0 else 0.5
+    
+    # Calculate upcoming game rest days
+    if not home_hist.empty:
+        last_home_game = home_hist["GAME_DATE"].max()
+        home_rest = (game_date - last_home_game).days - 1
+        home_rest = min(max(home_rest, 0), 7)
+    else:
+        home_rest = 3.0
 
-    # ── Away team rolling stats ───────────────────────────────────────────────
+    # ── Away team stats ───────────────────────────────────────────────────────
     away_hist = hist_df[hist_df["TEAM_ID"] == away_team_id].sort_values("GAME_DATE")
     away_hist = away_hist[away_hist["GAME_DATE"] < game_date]
 
@@ -232,10 +228,17 @@ def build_prediction_row(
     
     away_win_pct = float(away_season_games["WL_binary"].mean()) if len(away_season_games) > 0 else 0.5
     away_form5 = float(away_hist["WL_binary"].tail(5).mean()) if len(away_hist) > 0 else 0.5
-
-    # ── H2H (Robust implementation using GAME_ID intersection) ────────────────
-    shared_game_ids = set(home_hist["GAME_ID"]).intersection(set(away_hist["GAME_ID"]))
     
+    # Calculate upcoming game rest days
+    if not away_hist.empty:
+        last_away_game = away_hist["GAME_DATE"].max()
+        away_rest = (game_date - last_away_game).days - 1
+        away_rest = min(max(away_rest, 0), 7)
+    else:
+        away_rest = 3.0
+
+    # ── H2H ───────────────────────────────────────────────────────────────────
+    shared_game_ids = set(home_hist["GAME_ID"]).intersection(set(away_hist["GAME_ID"]))
     if len(shared_game_ids) > 0:
         h2h_games = home_hist[home_hist["GAME_ID"].isin(shared_game_ids)]
         home_h2h = float(h2h_games["WL_binary"].mean())
@@ -253,5 +256,7 @@ def build_prediction_row(
         "form5_diff": float(home_form5 - away_form5),
         "home_h2h": float(home_h2h),
         "away_h2h": float(1.0 - home_h2h),
+        "home_rest_days": float(home_rest),
+        "away_rest_days": float(away_rest),
     }
     return pd.DataFrame([row])[FEATURE_COLS]
