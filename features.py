@@ -6,19 +6,18 @@ Transforms raw nba_api game-log rows into a model-ready feature matrix.
 Each row in the output represents ONE game from the HOME team's perspective:
     • Target  : home_win  (1 = home team won, 0 = away team won)
     • Features:
-        - home_advantage   : always 1 (flag; keeps parity with prediction-time rows)
-        - month            : calendar month of the game (1–12)
-        - home_win_pct     : home team's season win% BEFORE this game
-        - away_win_pct     : away team's season win% before this game
-        - win_pct_diff     : home_win_pct − away_win_pct
-        - home_form5       : home team's win rate in last 5 games (any opponent)
-        - away_form5       : away team's win rate in last 5 games
-        - form5_diff       : home_form5 − away_form5
-        - home_h2h         : home team's win rate vs THIS away team (all-time in data)
-        - away_h2h         : away team's win rate vs THIS home team (= 1 − home_h2h)
-        - home_rest_days   : home team's rest days before this game (0 for B2B, max 7)
-        - away_rest_days   : away team's rest days before this game (0 for B2B, max 7)
-        - season_weight    : recency weight used during training (not a model feature)
+        - month                  : calendar month of the game (1–12)
+        - home_win_pct_at_home   : home team's season win% AT HOME BEFORE this game
+        - away_win_pct_on_road   : away team's season win% ON THE ROAD before this game
+        - win_pct_diff           : home_win_pct_at_home − away_win_pct_on_road
+        - home_form5             : home team's win rate in last 5 games (any opponent)
+        - away_form5             : away team's win rate in last 5 games
+        - form5_diff             : home_form5 − away_form5
+        - home_h2h               : home team's win rate vs THIS away team (all-time in data)
+        - away_h2h               : away team's win rate vs THIS home team (= 1 − home_h2h)
+        - home_rest_days         : home team's rest days before this game (0 for B2B, max 7)
+        - away_rest_days         : away team's rest days before this game (0 for B2B, max 7)
+        - season_weight          : recency weight used during training (not a model feature)
 
 Usage:
     from features import build_feature_matrix
@@ -30,10 +29,9 @@ import pandas as pd
 
 # Feature columns fed to the model (order matters for saved models)
 FEATURE_COLS = [
-    "home_advantage",
     "month",
-    "home_win_pct",
-    "away_win_pct",
+    "home_win_pct_at_home",
+    "away_win_pct_on_road",
     "win_pct_diff",
     "home_form5",
     "away_form5",
@@ -123,15 +121,24 @@ def build_feature_matrix(
 
     df = df.sort_values("GAME_DATE").reset_index(drop=True)
 
-    win_pct_map: dict = {}
+    win_pct_home_map: dict = {}
+    win_pct_road_map: dict = {}
     form5_map: dict = {}
     rest_days_map: dict = {}
 
     for (team_id, season), group in df.groupby(["TEAM_ID", "SEASON"]):
-        group_sorted = group.sort_values("GAME_DATE")
-        wp = _rolling_win_pct(group_sorted)
-        for idx, w in zip(group_sorted.index, wp):
-            win_pct_map[idx] = w
+        # Split to home and road for precise win percentages
+        home_group = group[group["is_home"] == 1].sort_values("GAME_DATE")
+        if not home_group.empty:
+            wp_home = _rolling_win_pct(home_group)
+            for idx, w in zip(home_group.index, wp_home):
+                win_pct_home_map[idx] = w
+
+        road_group = group[group["is_home"] == 0].sort_values("GAME_DATE")
+        if not road_group.empty:
+            wp_road = _rolling_win_pct(road_group)
+            for idx, w in zip(road_group.index, wp_road):
+                win_pct_road_map[idx] = w
 
     for team_id, group in df.groupby("TEAM_ID"):
         group_sorted = group.sort_values("GAME_DATE")
@@ -142,28 +149,29 @@ def build_feature_matrix(
         for idx, r in zip(group_sorted.index, rd):
             rest_days_map[idx] = r
 
-    df["win_pct_before"] = df.index.map(win_pct_map)
+    df["win_pct_at_home_before"] = df.index.map(win_pct_home_map).fillna(0.5)
+    df["win_pct_on_road_before"] = df.index.map(win_pct_road_map).fillna(0.5)
     df["form5"] = df.index.map(form5_map)
     df["rest_days_before"] = df.index.map(rest_days_map)
 
     home = df[df["is_home"] == 1][[
         "GAME_ID", "TEAM_ID", "GAME_DATE", "SEASON", "month",
-        "WL_binary", "win_pct_before", "form5", "rest_days_before"
+        "WL_binary", "win_pct_at_home_before", "form5", "rest_days_before"
     ]].rename(columns={
         "TEAM_ID": "home_team_id",
         "WL_binary": "home_win",
-        "win_pct_before": "home_win_pct",
+        "win_pct_at_home_before": "home_win_pct_at_home",
         "form5": "home_form5",
         "rest_days_before": "home_rest_days",
     })
 
     away = df[df["is_home"] == 0][[
         "GAME_ID", "TEAM_ID",
-        "WL_binary", "win_pct_before", "form5", "rest_days_before"
+        "WL_binary", "win_pct_on_road_before", "form5", "rest_days_before"
     ]].rename(columns={
         "TEAM_ID": "away_team_id",
         "WL_binary": "away_win",
-        "win_pct_before": "away_win_pct",
+        "win_pct_on_road_before": "away_win_pct_on_road",
         "form5": "away_form5",
         "rest_days_before": "away_rest_days",
     })
@@ -174,9 +182,8 @@ def build_feature_matrix(
     paired["home_h2h"] = _h2h_win_rate(paired)
     paired["away_h2h"] = 1.0 - paired["home_h2h"]
 
-    paired["win_pct_diff"] = paired["home_win_pct"] - paired["away_win_pct"]
+    paired["win_pct_diff"] = paired["home_win_pct_at_home"] - paired["away_win_pct_on_road"]
     paired["form5_diff"] = paired["home_form5"] - paired["away_form5"]
-    paired["home_advantage"] = 1
 
     paired["season_weight"] = paired["SEASON"].map(SEASON_WEIGHTS).fillna(1)
 
@@ -200,18 +207,22 @@ def build_prediction_row(
     hist_df = historical_df.copy()
     hist_df["GAME_DATE"] = pd.to_datetime(hist_df["GAME_DATE"]).dt.normalize()
     hist_df["WL_binary"] = (hist_df["WL"] == "W").astype(int)
+    # חשוב: נוסיף פה את סמן משחקי הבית כדי שנוכל לסנן לפיו
+    hist_df["is_home"] = hist_df["MATCHUP"].str.contains(r"vs\.", regex=True).astype(int)
 
     # ── Home team stats ───────────────────────────────────────────────────────
     home_hist = hist_df[hist_df["TEAM_ID"] == home_team_id].sort_values("GAME_DATE")
     home_hist = home_hist[home_hist["GAME_DATE"] < game_date]
 
     home_season = home_hist["SEASON"].max() if len(home_hist) > 0 else None
-    home_season_games = home_hist[home_hist["SEASON"] == home_season]
     
-    home_win_pct = float(home_season_games["WL_binary"].mean()) if len(home_season_games) > 0 else 0.5
+    # חישוב אחוז ניצחונות ספציפית בבית העונה
+    home_hist_at_home = home_hist[home_hist["is_home"] == 1]
+    home_season_games_at_home = home_hist_at_home[home_hist_at_home["SEASON"] == home_season]
+    home_win_pct_at_home = float(home_season_games_at_home["WL_binary"].mean()) if len(home_season_games_at_home) > 0 else 0.5
+    
     home_form5 = float(home_hist["WL_binary"].tail(5).mean()) if len(home_hist) > 0 else 0.5
     
-    # Calculate upcoming game rest days
     if not home_hist.empty:
         last_home_game = home_hist["GAME_DATE"].max()
         home_rest = (game_date - last_home_game).days - 1
@@ -224,12 +235,14 @@ def build_prediction_row(
     away_hist = away_hist[away_hist["GAME_DATE"] < game_date]
 
     away_season = away_hist["SEASON"].max() if len(away_hist) > 0 else None
-    away_season_games = away_hist[away_hist["SEASON"] == away_season]
     
-    away_win_pct = float(away_season_games["WL_binary"].mean()) if len(away_season_games) > 0 else 0.5
+    # חישוב אחוז ניצחונות ספציפית בחוץ העונה
+    away_hist_on_road = away_hist[away_hist["is_home"] == 0]
+    away_season_games_on_road = away_hist_on_road[away_hist_on_road["SEASON"] == away_season]
+    away_win_pct_on_road = float(away_season_games_on_road["WL_binary"].mean()) if len(away_season_games_on_road) > 0 else 0.5
+    
     away_form5 = float(away_hist["WL_binary"].tail(5).mean()) if len(away_hist) > 0 else 0.5
     
-    # Calculate upcoming game rest days
     if not away_hist.empty:
         last_away_game = away_hist["GAME_DATE"].max()
         away_rest = (game_date - last_away_game).days - 1
@@ -246,11 +259,10 @@ def build_prediction_row(
         home_h2h = 0.5
 
     row = {
-        "home_advantage": 1.0,
         "month": float(month),
-        "home_win_pct": float(home_win_pct),
-        "away_win_pct": float(away_win_pct),
-        "win_pct_diff": float(home_win_pct - away_win_pct),
+        "home_win_pct_at_home": float(home_win_pct_at_home),
+        "away_win_pct_on_road": float(away_win_pct_on_road),
+        "win_pct_diff": float(home_win_pct_at_home - away_win_pct_on_road),
         "home_form5": float(home_form5),
         "away_form5": float(away_form5),
         "form5_diff": float(home_form5 - away_form5),

@@ -1,6 +1,6 @@
 # 🏀 NBA Game Winner Probability Predictor
 
-Predicts the winner of every NBA regular-season game using a **Logistic Regression + Random Forest ensemble** trained on 6 seasons of data (2019-20 → 2024-25), with recent seasons weighted more heavily.
+Predicts the winner of every NBA regular-season game using a Logistic Regression + Random Forest ensemble trained on 6 seasons of data (6 seasons ago -> current season), with recent seasons weighted more heavily.
 
 ---
 
@@ -8,11 +8,10 @@ Predicts the winner of every NBA regular-season game using a **Logistic Regressi
 
 | Feature | Description |
 |---|---|
-| `home_advantage` | 1 = home team (always 1 at prediction time) |
 | `month` | Calendar month of the game (captures fatigue/pace across the season) |
-| `home_win_pct` | Home team's season win% before this game |
-| `away_win_pct` | Away team's season win% before this game |
-| `win_pct_diff` | home − away win% |
+| `home_win_pct_at_home` | Home team's season win% at home before this game |
+| `away_win_pct_on_road` | Away team's season win% on the road before this game |
+| `win_pct_diff` | home_win_pct_at_home − away_win_pct_on_road |
 | `home_form5` | Home team's win rate in their last 5 games |
 | `away_form5` | Away team's win rate in their last 5 games |
 | `form5_diff` | home − away form5 |
@@ -119,7 +118,7 @@ Each run produces `outputs/predictions_YYYY-MM-DD.html`.  Open it in any browser
 For each game you'll see:
 - **Predicted winner** with a confidence badge (High / Medium / Toss-up)
 - Side-by-side probability bars for Logistic Regression, Random Forest, and the Ensemble
-
+- **Actual Winner validation** (if running back-tests on past dates)
 ---
 
 ## Notes
