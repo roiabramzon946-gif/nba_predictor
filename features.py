@@ -42,6 +42,17 @@ FEATURE_COLS = [
     "away_rest_days",
 ]
 
+# Prior "pseudo-games" added to every team's record before computing
+# season win% (home_win_pct_at_home / away_win_pct_on_road). Without this,
+# a team's win% after just 1-2 games of a new season is either 0% or 100%,
+# which is an extreme/noisy signal. Adding 4 fictional wins + 4 fictional
+# losses (a neutral 50% prior, worth 8 "games") smooths this out — it gets
+# diluted toward the team's real record as the season goes on.
+WIN_PCT_PRIOR_WINS = 4
+WIN_PCT_PRIOR_LOSSES = 4
+WIN_PCT_PRIOR_GAMES = WIN_PCT_PRIOR_WINS + WIN_PCT_PRIOR_LOSSES
+
+
 # Map season string → numeric recency weight (oldest = 1, newest = 6)
 def _build_season_weights(num_seasons: int = 6) -> dict:
     from datetime import date
@@ -63,12 +74,19 @@ SEASON_WEIGHTS = _build_season_weights(num_seasons=6)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _rolling_win_pct(team_games: pd.DataFrame) -> pd.Series:
+    """
+    Cumulative win% before each game, with a Bayesian prior of
+    WIN_PCT_PRIOR_WINS wins and WIN_PCT_PRIOR_LOSSES losses added to every
+    team's record (see constants above). The first game of a season now
+    starts at exactly 0.5 (4 / 8), and each additional game's win% moves
+    gradually toward the team's real record instead of jumping straight
+    to 0% or 100%.
+    """
     wins = team_games["WL_binary"].values
     cum_wins = np.concatenate([[0], np.cumsum(wins[:-1])])
     cum_games = np.arange(len(wins))
-    
-    with np.errstate(invalid="ignore"):
-        pct = np.where(cum_games == 0, 0.5, cum_wins / cum_games)
+
+    pct = (cum_wins + WIN_PCT_PRIOR_WINS) / (cum_games + WIN_PCT_PRIOR_GAMES)
     return pd.Series(pct, index=team_games.index)
 
 
@@ -216,10 +234,13 @@ def build_prediction_row(
 
     home_season = home_hist["SEASON"].max() if len(home_hist) > 0 else None
     
-    # חישוב אחוז ניצחונות ספציפית בבית העונה
+    # חישוב אחוז ניצחונות ספציפית בבית העונה (with the same +4W/+4L prior
+    # used in build_feature_matrix, so training and prediction match)
     home_hist_at_home = home_hist[home_hist["is_home"] == 1]
     home_season_games_at_home = home_hist_at_home[home_hist_at_home["SEASON"] == home_season]
-    home_win_pct_at_home = float(home_season_games_at_home["WL_binary"].mean()) if len(home_season_games_at_home) > 0 else 0.5
+    home_wins_at_home = float(home_season_games_at_home["WL_binary"].sum())
+    home_games_at_home = len(home_season_games_at_home)
+    home_win_pct_at_home = (home_wins_at_home + WIN_PCT_PRIOR_WINS) / (home_games_at_home + WIN_PCT_PRIOR_GAMES)
     
     home_form5 = float(home_hist["WL_binary"].tail(5).mean()) if len(home_hist) > 0 else 0.5
     
@@ -236,10 +257,12 @@ def build_prediction_row(
 
     away_season = away_hist["SEASON"].max() if len(away_hist) > 0 else None
     
-    # חישוב אחוז ניצחונות ספציפית בחוץ העונה
+    # חישוב אחוז ניצחונות ספציפית בחוץ העונה (same +4W/+4L prior as above)
     away_hist_on_road = away_hist[away_hist["is_home"] == 0]
     away_season_games_on_road = away_hist_on_road[away_hist_on_road["SEASON"] == away_season]
-    away_win_pct_on_road = float(away_season_games_on_road["WL_binary"].mean()) if len(away_season_games_on_road) > 0 else 0.5
+    away_wins_on_road = float(away_season_games_on_road["WL_binary"].sum())
+    away_games_on_road = len(away_season_games_on_road)
+    away_win_pct_on_road = (away_wins_on_road + WIN_PCT_PRIOR_WINS) / (away_games_on_road + WIN_PCT_PRIOR_GAMES)
     
     away_form5 = float(away_hist["WL_binary"].tail(5).mean()) if len(away_hist) > 0 else 0.5
     

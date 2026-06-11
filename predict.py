@@ -174,7 +174,8 @@ def _confidence_badge(conf: float) -> str:
 
 def build_html(predictions: pd.DataFrame, game_date: date) -> str:
     """Render the full HTML dashboard string."""
-    date_str = game_date.strftime("%A, %B %-d %Y")
+    # Cross-platform safe date formatting (avoids Linux-only %-d)
+    date_str = f"{game_date.strftime('%A, %B')} {game_date.day}, {game_date.year}"
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     cards_html = ""
