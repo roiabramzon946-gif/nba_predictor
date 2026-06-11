@@ -10,7 +10,7 @@ Predicts the winner of every NBA regular-season game using a **Logistic Regressi
 |---|---|
 | `home_advantage` | 1 = home team (always 1 at prediction time) |
 | `month` | Calendar month of the game (captures fatigue/pace across the season) |
-| `home_win_pct` | Home team's season win% **before** this game |
+| `home_win_pct` | Home team's season win% before this game |
 | `away_win_pct` | Away team's season win% before this game |
 | `win_pct_diff` | home − away win% |
 | `home_form5` | Home team's win rate in their last 5 games |
@@ -18,9 +18,10 @@ Predicts the winner of every NBA regular-season game using a **Logistic Regressi
 | `form5_diff` | home − away form5 |
 | `home_h2h` | Home team's historical win rate vs this specific opponent |
 | `away_h2h` | Away team's historical win rate vs this specific opponent |
+| `home_rest_days` | Home team's rest days before this game (0 for back-to-back, max 7) |
+| `away_rest_days` | Away team's rest days before this game (0 for back-to-back, max 7) |
 
-**Recency weights**: season 2019-20 → weight 1 … 2024-25 → weight 6.
-
+**Recency weights**: current season → weight 6 … 6 seasons ago → weight 1.
 ---
 
 ## Project structure
