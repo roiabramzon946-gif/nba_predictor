@@ -40,6 +40,8 @@ FEATURE_COLS = [
     "away_h2h",
     "home_rest_days",
     "away_rest_days",
+    "home_missing_mins",   # total avg mins/game of injured-out home players
+    "away_missing_mins",   # total avg mins/game of injured-out away players
 ]
 
 # Prior "pseudo-games" added to every team's record before computing
@@ -51,6 +53,16 @@ FEATURE_COLS = [
 WIN_PCT_PRIOR_WINS = 4
 WIN_PCT_PRIOR_LOSSES = 4
 WIN_PCT_PRIOR_GAMES = WIN_PCT_PRIOR_WINS + WIN_PCT_PRIOR_LOSSES
+
+# Players averaging fewer than this many minutes per game are not considered
+# "key" rotation players — their absence doesn't register as missing minutes.
+KEY_PLAYER_MIN_THRESHOLD = 15.0
+
+# A player must have logged at least this many games for a team in a season
+# before they are considered "established" and their absence is tracked.
+# This excludes G-League call-ups, 10-day contracts, and mid-season trade
+# pickups who haven't yet played enough games to be reliable rotation pieces.
+KEY_PLAYER_MIN_GAMES = 30
 
 
 # Map season string → numeric recency weight (oldest = 1, newest = 6)
@@ -125,11 +137,93 @@ def _h2h_win_rate(games_df: pd.DataFrame) -> pd.Series:
     return pd.Series(h2h, index=games_df.index)
 
 
+def compute_missing_mins(player_logs_df: pd.DataFrame) -> dict:
+    """
+    Pre-compute, for every (GAME_ID, TEAM_ID) pair that appears in the player
+    logs, the total average minutes of key players who did NOT appear in that game.
+
+    A player is "key" if they logged at least KEY_PLAYER_MIN_GAMES games AND
+    averaged at least KEY_PLAYER_MIN_THRESHOLD minutes per game for that team
+    in that season.  The two-part threshold filters out:
+      - G-League call-ups and 10-day contracts (too few games)
+      - End-of-bench players (too few minutes)
+      - Mid-season trade acquisitions who haven't established themselves yet
+
+    Temporal guard: we only expect a player at games on or after their FIRST
+    game with that team-season.  Without this, a player traded in at game 50
+    would be marked as "missing" from all 49 games before they arrived —
+    generating completely spurious missing-minutes totals.
+
+    Returns
+    -------
+    dict mapping (game_id_str, team_id_int) → float (total missing minutes).
+    Games where every key player appeared will be absent from the dict
+    (look up with .get(..., 0.0)).
+    """
+    logs = player_logs_df.copy()
+    logs["GAME_ID"] = logs["GAME_ID"].astype(str)
+    logs["TEAM_ID"] = logs["TEAM_ID"].astype(int)
+    logs["PLAYER_ID"] = logs["PLAYER_ID"].astype(int)
+    logs["GAME_DATE"] = pd.to_datetime(logs["GAME_DATE"])
+
+    # ── Step 1: compute each player's profile for each (team, season) ─────────
+    # avg_min is over the games they actually played — not the full roster.
+    # first_date is when they first appeared for this team-season (arrival date).
+    player_profiles = (
+        logs.groupby(["PLAYER_ID", "TEAM_ID", "SEASON"])
+        .agg(
+            games_played=("GAME_ID", "count"),
+            avg_min=("MIN_float", "mean"),
+            first_date=("GAME_DATE", "min"),
+        )
+        .reset_index()
+    )
+
+    # ── Step 2: filter to established key players only ─────────────────────────
+    key_players = player_profiles[
+        (player_profiles["games_played"] >= KEY_PLAYER_MIN_GAMES)
+        & (player_profiles["avg_min"] >= KEY_PLAYER_MIN_THRESHOLD)
+    ].copy()
+
+    # ── Step 3: all (GAME_ID, TEAM_ID, SEASON, GAME_DATE) combos ──────────────
+    game_team_info = (
+        logs[["GAME_ID", "TEAM_ID", "SEASON", "GAME_DATE"]]
+        .drop_duplicates()
+    )
+
+    # ── Step 4: expand — pair each key player with every game their team played
+    expanded = key_players.merge(game_team_info, on=["TEAM_ID", "SEASON"], how="inner")
+
+    # Temporal guard: only expect the player from the date they first appeared
+    expanded = expanded[expanded["GAME_DATE"] >= expanded["first_date"]]
+
+    # ── Step 5: anti-join — key players who did NOT appear in a game ──────────
+    appeared = (
+        logs[logs["MIN_float"] > 0][["GAME_ID", "TEAM_ID", "PLAYER_ID"]]
+        .drop_duplicates()
+    )
+    appeared["_appeared"] = True
+
+    merged = expanded.merge(
+        appeared, on=["GAME_ID", "TEAM_ID", "PLAYER_ID"], how="left"
+    )
+    missing = merged[merged["_appeared"].isna()]
+
+    # ── Step 6: sum missing minutes per (GAME_ID, TEAM_ID) ───────────────────
+    result = (
+        missing.groupby(["GAME_ID", "TEAM_ID"])["avg_min"]
+        .sum()
+        .to_dict()
+    )
+    return {(gid, int(tid)): v for (gid, tid), v in result.items()}
+
+
 # ── Main Builder ──────────────────────────────────────────────────────────────
 
 def build_feature_matrix(
     raw_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    player_logs_df: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     df = raw_df.copy()
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     df["WL_binary"] = (df["WL"] == "W").astype(int)
@@ -167,31 +261,34 @@ def build_feature_matrix(
         for idx, r in zip(group_sorted.index, rd):
             rest_days_map[idx] = r
 
-    df["win_pct_at_home_before"] = df.index.map(win_pct_home_map).fillna(0.5)
-    df["win_pct_on_road_before"] = df.index.map(win_pct_road_map).fillna(0.5)
+    _prior = WIN_PCT_PRIOR_WINS / WIN_PCT_PRIOR_GAMES
+    df["win_pct_at_home_before"] = df.index.map(win_pct_home_map).fillna(_prior)
+    df["win_pct_on_road_before"] = df.index.map(win_pct_road_map).fillna(_prior)
     df["form5"] = df.index.map(form5_map)
     df["rest_days_before"] = df.index.map(rest_days_map)
 
     home = df[df["is_home"] == 1][[
         "GAME_ID", "TEAM_ID", "GAME_DATE", "SEASON", "month",
-        "WL_binary", "win_pct_at_home_before", "form5", "rest_days_before"
+        "WL_binary", "win_pct_at_home_before", "form5", "rest_days_before", "PTS"
     ]].rename(columns={
         "TEAM_ID": "home_team_id",
         "WL_binary": "home_win",
         "win_pct_at_home_before": "home_win_pct_at_home",
         "form5": "home_form5",
         "rest_days_before": "home_rest_days",
+        "PTS": "home_pts",
     })
 
     away = df[df["is_home"] == 0][[
         "GAME_ID", "TEAM_ID",
-        "WL_binary", "win_pct_on_road_before", "form5", "rest_days_before"
+        "WL_binary", "win_pct_on_road_before", "form5", "rest_days_before", "PTS"
     ]].rename(columns={
         "TEAM_ID": "away_team_id",
         "WL_binary": "away_win",
         "win_pct_on_road_before": "away_win_pct_on_road",
         "form5": "away_form5",
         "rest_days_before": "away_rest_days",
+        "PTS": "away_pts",
     })
 
     paired = home.merge(away, on="GAME_ID").sort_values("GAME_DATE").reset_index(drop=True)
@@ -205,12 +302,37 @@ def build_feature_matrix(
 
     paired["season_weight"] = paired["SEASON"].map(SEASON_WEIGHTS).fillna(1)
 
+    # Point differential from the home team's perspective (positive = home team won by that margin)
+    paired["point_diff"] = paired["home_pts"] - paired["away_pts"]
+
+    # ── Injury / missing-player minutes ───────────────────────────────────────
+    # If player_logs_df is provided, compute how many avg-minutes worth of key
+    # players each team was missing for each game.  Defaults to 0.0 otherwise
+    # so the feature always exists and models trained without it are still valid
+    # (though they'll benefit from retraining once player logs are available).
+    if player_logs_df is not None and not player_logs_df.empty:
+        print("  Computing missing-player minutes …")
+        missing_map = compute_missing_mins(player_logs_df)
+        paired["GAME_ID_str"] = paired["GAME_ID"].astype(str)
+        paired["home_missing_mins"] = paired.apply(
+            lambda r: missing_map.get((r["GAME_ID_str"], int(r["home_team_id"])), 0.0),
+            axis=1,
+        )
+        paired["away_missing_mins"] = paired.apply(
+            lambda r: missing_map.get((r["GAME_ID_str"], int(r["away_team_id"])), 0.0),
+            axis=1,
+        )
+    else:
+        paired["home_missing_mins"] = 0.0
+        paired["away_missing_mins"] = 0.0
+
     X = paired[FEATURE_COLS].astype(float)
     y = paired["home_win"].astype(int)
     weights = paired["season_weight"].astype(float)
+    margins = paired["point_diff"].astype(float)
 
     print(f"✓ Feature matrix: {X.shape[0]:,} games × {X.shape[1]} features")
-    return X, y, weights
+    return X, y, weights, margins
 
 
 def build_prediction_row(
@@ -218,6 +340,8 @@ def build_prediction_row(
     away_team_id: int,
     game_date,
     historical_df: pd.DataFrame,
+    home_missing_mins: float = 0.0,
+    away_missing_mins: float = 0.0,
 ) -> pd.DataFrame:
     game_date = pd.Timestamp(game_date).normalize()
     month = game_date.month
@@ -293,5 +417,7 @@ def build_prediction_row(
         "away_h2h": float(1.0 - home_h2h),
         "home_rest_days": float(home_rest),
         "away_rest_days": float(away_rest),
+        "home_missing_mins": float(home_missing_mins),
+        "away_missing_mins": float(away_missing_mins),
     }
     return pd.DataFrame([row])[FEATURE_COLS]

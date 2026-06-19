@@ -16,12 +16,12 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
-from fetch_data import fetch_all_seasons
+from fetch_data import fetch_all_seasons, fetch_player_game_logs
 from features import build_feature_matrix, FEATURE_COLS
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -30,27 +30,33 @@ MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 LR_PATH = os.path.join(MODELS_DIR, "lr_model.joblib")
 RF_PATH = os.path.join(MODELS_DIR, "rf_model.joblib")
 SCALER_PATH = os.path.join(MODELS_DIR, "scaler.joblib")
+MARGIN_PATH = os.path.join(MODELS_DIR, "margin_model.joblib")
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(raw_df: pd.DataFrame | None = None) -> dict:
     """
-    Build features, evaluate via manual CV without data leakage, 
+    Build features, evaluate via manual CV without data leakage,
     train final models on full data, and save.
+    Trains three models: LR and RF (win/loss classifiers) + Ridge (point margin regressor).
     """
     os.makedirs(MODELS_DIR, exist_ok=True)
 
     if raw_df is None:
         raw_df = fetch_all_seasons()
 
+    print("Fetching player game logs (for injury/missing-mins feature) …")
+    player_logs_df = fetch_player_game_logs()
+
     print("Building feature matrix …")
-    X, y, weights = build_feature_matrix(raw_df)
-    
+    X, y, weights, margins = build_feature_matrix(raw_df, player_logs_df=player_logs_df)
+
     # Convert to numpy arrays for easier slicing in the CV loop
     X_arr = X.values
     y_arr = y.values
     weights_arr = weights.values
+    margins_arr = margins.values
 
     # TimeSeriesSplit keeps chronological order, preventing future data leakage
     cv = TimeSeriesSplit(n_splits=5)
@@ -58,44 +64,53 @@ def train(raw_df: pd.DataFrame | None = None) -> dict:
     # Base models for CV
     lr_base = LogisticRegression(max_iter=1000, C=1.0, solver="lbfgs", random_state=42)
     rf_base = RandomForestClassifier(
-        n_estimators=300, max_depth=8, min_samples_leaf=20, 
-        max_features="sqrt", class_weight="balanced", 
+        n_estimators=300, max_depth=8, min_samples_leaf=20,
+        max_features="sqrt", class_weight="balanced",
         random_state=42, n_jobs=-1
     )
+    ridge_base = Ridge(alpha=1.0)
 
     lr_scores = []
     rf_scores = []
+    margin_rmses = []
 
     print("\nRunning Manual Cross-Validation (Time-Series) …")
     for fold, (train_idx, test_idx) in enumerate(cv.split(X_arr)):
         # 1. Split the data
         X_train, y_train, w_train = X_arr[train_idx], y_arr[train_idx], weights_arr[train_idx]
         X_test, y_test = X_arr[test_idx], y_arr[test_idx]
-        
+        m_train, m_test = margins_arr[train_idx], margins_arr[test_idx]
+
         # 2. Scale the data (fit ONLY on training fold to prevent leakage)
         fold_scaler = StandardScaler()
         X_train_scaled = fold_scaler.fit_transform(X_train)
         X_test_scaled = fold_scaler.transform(X_test)
-        
+
         # 3. Train models with sample weights
         lr_base.fit(X_train_scaled, y_train, sample_weight=w_train)
         rf_base.fit(X_train_scaled, y_train, sample_weight=w_train)
-        
+        ridge_base.fit(X_train_scaled, m_train, sample_weight=w_train)
+
         # 4. Score
         lr_acc = lr_base.score(X_test_scaled, y_test)
         rf_acc = rf_base.score(X_test_scaled, y_test)
-        
+        margin_pred = ridge_base.predict(X_test_scaled)
+        rmse = float(np.sqrt(np.mean((margin_pred - m_test) ** 2)))
+
         lr_scores.append(lr_acc)
         rf_scores.append(rf_acc)
-        
-        print(f"  Fold {fold+1}: LR = {lr_acc:.4f} | RF = {rf_acc:.4f}")
+        margin_rmses.append(rmse)
+
+        print(f"  Fold {fold+1}: LR = {lr_acc:.4f} | RF = {rf_acc:.4f} | Margin RMSE = {rmse:.2f} pts")
 
     lr_cv_mean, lr_cv_std = np.mean(lr_scores), np.std(lr_scores)
     rf_cv_mean, rf_cv_std = np.mean(rf_scores), np.std(rf_scores)
-    
+    margin_rmse_mean = float(np.mean(margin_rmses))
+
     print(f"\nFinal CV Results:")
-    print(f"  LR CV accuracy: {lr_cv_mean:.4f} ± {lr_cv_std:.4f}")
-    print(f"  RF CV accuracy: {rf_cv_mean:.4f} ± {rf_cv_std:.4f}")
+    print(f"  LR CV accuracy:   {lr_cv_mean:.4f} ± {lr_cv_std:.4f}")
+    print(f"  RF CV accuracy:   {rf_cv_mean:.4f} ± {rf_cv_std:.4f}")
+    print(f"  Margin RMSE:      {margin_rmse_mean:.2f} pts (avg error in predicted point spread)")
 
     # ── Final Training & Saving (On all available data) ───────────────────────
     print("\nFitting final models on the entire dataset …")
@@ -114,13 +129,19 @@ def train(raw_df: pd.DataFrame | None = None) -> dict:
 
     # Train and save the final Random Forest model
     rf_final = RandomForestClassifier(
-        n_estimators=300, max_depth=8, min_samples_leaf=20, 
-        max_features="sqrt", class_weight="balanced", 
+        n_estimators=300, max_depth=8, min_samples_leaf=20,
+        max_features="sqrt", class_weight="balanced",
         random_state=42, n_jobs=-1
     )
     rf_final.fit(X_scaled_full, y_arr, sample_weight=weights_arr)
     joblib.dump(rf_final, RF_PATH)
     print(f"  ✓ RF model saved → {RF_PATH}")
+
+    # Train and save the final Ridge regression model (point margin predictor)
+    margin_final = Ridge(alpha=1.0)
+    margin_final.fit(X_scaled_full, margins_arr, sample_weight=weights_arr)
+    joblib.dump(margin_final, MARGIN_PATH)
+    print(f"  ✓ Margin model saved → {MARGIN_PATH}")
 
     # Feature Importance
     coef_df = pd.DataFrame(
@@ -140,6 +161,7 @@ def train(raw_df: pd.DataFrame | None = None) -> dict:
         "lr_cv_std": float(lr_cv_std),
         "rf_cv_mean": float(rf_cv_mean),
         "rf_cv_std": float(rf_cv_std),
+        "margin_rmse_mean": margin_rmse_mean,
         "n_games": len(X),
     }
     print(f"\n✓ Training complete.  {results['n_games']:,} games used.")
@@ -147,8 +169,8 @@ def train(raw_df: pd.DataFrame | None = None) -> dict:
 
 
 def load_models():
-    """Load and return (lr, rf, scaler). Raises FileNotFoundError if not trained yet."""
-    for path in (LR_PATH, RF_PATH, SCALER_PATH):
+    """Load and return (lr, rf, scaler, margin_model). Raises FileNotFoundError if not trained yet."""
+    for path in (LR_PATH, RF_PATH, SCALER_PATH, MARGIN_PATH):
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"Model file not found: {path}\n"
@@ -157,7 +179,8 @@ def load_models():
     lr = joblib.load(LR_PATH)
     rf = joblib.load(RF_PATH)
     scaler = joblib.load(SCALER_PATH)
-    return lr, rf, scaler
+    margin_model = joblib.load(MARGIN_PATH)
+    return lr, rf, scaler, margin_model
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

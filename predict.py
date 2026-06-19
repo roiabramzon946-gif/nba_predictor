@@ -16,13 +16,14 @@ import argparse
 import warnings
 from datetime import date, datetime
 
+import requests
 import numpy as np
 import pandas as pd
 from nba_api.stats.endpoints import scoreboardv2
 from nba_api.stats.static import teams as nba_teams_static
 
-from fetch_data import fetch_all_seasons, GAMES_FILE
-from features import build_prediction_row, FEATURE_COLS
+from fetch_data import fetch_all_seasons, fetch_player_game_logs, GAMES_FILE
+from features import build_prediction_row, FEATURE_COLS, KEY_PLAYER_MIN_THRESHOLD
 from train import load_models
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -37,6 +38,106 @@ def _build_team_lookup() -> dict:
     return {t["id"]: t["full_name"] for t in all_teams}
 
 TEAM_LOOKUP = _build_team_lookup()
+
+# Reverse lookup: full team name → team ID (used for injury matching)
+NAME_TO_ID = {v: k for k, v in TEAM_LOOKUP.items()}
+
+
+# ── Injury report ─────────────────────────────────────────────────────────────
+
+ESPN_INJURY_URL = (
+    "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+)
+# Statuses from ESPN that mean the player definitely won't play
+OUT_STATUSES = {"Out", "Injured Reserve"}
+
+
+def fetch_injury_report() -> dict:
+    """
+    Fetch today's NBA injury report from ESPN's public JSON API.
+
+    Returns
+    -------
+    dict mapping team_full_name → list of player display names who are Out.
+    Example: {"Miami Heat": ["Jimmy Butler", "Tyler Herro"], ...}
+
+    On any network or parse error, returns an empty dict so predictions
+    proceed normally with home_missing_mins = away_missing_mins = 0.
+    """
+    try:
+        r = requests.get(ESPN_INJURY_URL, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        print(f"  ⚠ ESPN injury fetch failed: {exc}")
+        print("  Continuing without injury data (missing mins will be 0).")
+        return {}
+
+    out_by_team: dict = {}
+    for team_entry in data.get("injuries", []):
+        team_name = team_entry.get("displayName", "")
+        out_names = [
+            inj["athlete"]["displayName"]
+            for inj in team_entry.get("injuries", [])
+            if inj.get("status") in OUT_STATUSES
+            and inj.get("athlete", {}).get("displayName")
+        ]
+        if out_names:
+            out_by_team[team_name] = out_names
+
+    n_out = sum(len(v) for v in out_by_team.values())
+    print(f"  ESPN injury report: {n_out} player(s) listed as Out across "
+          f"{len(out_by_team)} team(s).")
+    return out_by_team
+
+
+def _missing_mins_for_team(
+    team_name: str,
+    team_id: int,
+    out_by_team: dict,
+    player_logs_df: pd.DataFrame,
+) -> float:
+    """
+    Given the Out-player list for one team (from ESPN), look up each player's
+    season-average minutes in player_logs_df and return the total.
+    Only players averaging >= KEY_PLAYER_MIN_THRESHOLD minutes count.
+    """
+    out_names = out_by_team.get(team_name, [])
+    if not out_names or player_logs_df is None or player_logs_df.empty:
+        return 0.0
+
+    team_logs = player_logs_df[player_logs_df["TEAM_ID"] == team_id]
+    if team_logs.empty:
+        return 0.0
+
+    # Use the most recent season in the cache
+    latest_season = team_logs["SEASON"].max()
+    season_avgs = (
+        team_logs[team_logs["SEASON"] == latest_season]
+        .groupby("PLAYER_NAME")["MIN_float"]
+        .mean()
+        .reset_index()
+    )
+
+    total_missing = 0.0
+    for out_name in out_names:
+        # 1. Exact case-insensitive match
+        match = season_avgs[
+            season_avgs["PLAYER_NAME"].str.lower() == out_name.lower()
+        ]
+        if match.empty:
+            # 2. Last-name fallback (handles "Jr.", suffix differences)
+            last = out_name.split()[-1].lower()
+            match = season_avgs[
+                season_avgs["PLAYER_NAME"].str.lower().str.split().str[-1] == last
+            ]
+        if not match.empty:
+            avg_min = float(match.iloc[0]["MIN_float"])
+            if avg_min >= KEY_PLAYER_MIN_THRESHOLD:
+                total_missing += avg_min
+                print(f"    ↳ Out: {out_name} ({avg_min:.1f} avg min/game)")
+
+    return total_missing
 
 
 # ── Fetch today's schedule ────────────────────────────────────────────────────
@@ -87,7 +188,7 @@ def predict_games(games: pd.DataFrame, game_date: date) -> pd.DataFrame:
     Given a DataFrame from get_todays_games(), run both models and return
     predictions with probability columns added.
     """
-    lr, rf, scaler = load_models()
+    lr, rf, scaler, margin_model = load_models()
 
     if not os.path.exists(GAMES_FILE):
         raise FileNotFoundError(
@@ -95,15 +196,27 @@ def predict_games(games: pd.DataFrame, game_date: date) -> pd.DataFrame:
         )
     historical = pd.read_csv(GAMES_FILE, parse_dates=["GAME_DATE"])
 
+    # ── Injury report ─────────────────────────────────────────────────────────
+    print("Fetching injury report …")
+    out_by_team = fetch_injury_report()
+    player_logs_df = fetch_player_game_logs()   # loads from cache; fast
+
     rows = []
     actual_winners = []
+    actual_scores = []    # e.g. "112 – 108" (home – away)
+    actual_margins = []   # home_pts - away_pts, or None if pending
 
     for _, game in games.iterrows():
         # --- מציאת המנצחת בפועל (אם המשחק כבר התקיים ונמצא בהיסטוריה) ---
         hist_game = historical[historical["GAME_ID"].astype(int) == int(game["GAME_ID"])]
+        home_pts_actual = None
+        away_pts_actual = None
         if not hist_game.empty:
             home_row = hist_game[hist_game["TEAM_ID"] == int(game["HOME_TEAM_ID"])]
+            away_row = hist_game[hist_game["TEAM_ID"] == int(game["AWAY_TEAM_ID"])]
             if not home_row.empty and pd.notna(home_row.iloc[0]["WL"]):
+                home_pts_actual = int(home_row.iloc[0]["PTS"])
+                away_pts_actual = int(away_row.iloc[0]["PTS"]) if not away_row.empty else None
                 if home_row.iloc[0]["WL"] == "W":
                     actual_winners.append(game["HOME_TEAM_NAME"])
                 else:
@@ -112,13 +225,32 @@ def predict_games(games: pd.DataFrame, game_date: date) -> pd.DataFrame:
                 actual_winners.append("Pending")
         else:
             actual_winners.append("Pending")
+
+        if home_pts_actual is not None and away_pts_actual is not None:
+            actual_scores.append(f"{home_pts_actual} – {away_pts_actual}")
+            actual_margins.append(home_pts_actual - away_pts_actual)
+        else:
+            actual_scores.append("Pending")
+            actual_margins.append(None)
         # -----------------------------------------------------------------
+
+        # Compute missing minutes for each team using the injury report
+        home_name = game["HOME_TEAM_NAME"]
+        away_name = game["AWAY_TEAM_NAME"]
+        home_mm = _missing_mins_for_team(
+            home_name, int(game["HOME_TEAM_ID"]), out_by_team, player_logs_df
+        )
+        away_mm = _missing_mins_for_team(
+            away_name, int(game["AWAY_TEAM_ID"]), out_by_team, player_logs_df
+        )
 
         feat_row = build_prediction_row(
             home_team_id=int(game["HOME_TEAM_ID"]),
             away_team_id=int(game["AWAY_TEAM_ID"]),
             game_date=game_date,
             historical_df=historical,
+            home_missing_mins=home_mm,
+            away_missing_mins=away_mm,
         )
         rows.append(feat_row)
 
@@ -128,6 +260,9 @@ def predict_games(games: pd.DataFrame, game_date: date) -> pd.DataFrame:
     lr_probs = lr.predict_proba(X_scaled)[:, 1]   # P(home wins)
     rf_probs = rf.predict_proba(X_scaled)[:, 1]
     ensemble_probs = (lr_probs + rf_probs) / 2.0
+
+    # Point margin prediction (positive = home team favoured by that many points)
+    raw_margins = margin_model.predict(X_scaled)
 
     games = games.copy()
     games["lr_home_prob"] = np.round(lr_probs * 100, 1)
@@ -143,7 +278,21 @@ def predict_games(games: pd.DataFrame, game_date: date) -> pd.DataFrame:
         np.round(ensemble_probs * 100, 1),
         np.round((1 - ensemble_probs) * 100, 1),
     )
+    # Spread label: e.g. "Lakers by 4.5" or "Toss-up"
+    spread_labels = []
+    for i, margin in enumerate(raw_margins):
+        abs_margin = abs(margin)
+        if abs_margin < 1.5:
+            spread_labels.append("Pick'em")
+        elif margin > 0:
+            spread_labels.append(f"{games.iloc[i]['HOME_TEAM_NAME']} by {abs_margin:.1f}")
+        else:
+            spread_labels.append(f"{games.iloc[i]['AWAY_TEAM_NAME']} by {abs_margin:.1f}")
+    games["projected_spread"] = spread_labels
+    games["raw_margin"] = np.round(raw_margins, 1)
     games["actual_winner"] = actual_winners
+    games["actual_score"] = actual_scores
+    games["actual_margin"] = actual_margins
     return games
 
 
@@ -184,22 +333,61 @@ def build_html(predictions: pd.DataFrame, game_date: date) -> str:
         away = row["AWAY_TEAM_NAME"]
         winner = row["predicted_winner"]
         actual = row["actual_winner"]
+        actual_score = row["actual_score"]
+        actual_margin = row["actual_margin"]
+        raw_margin = row["raw_margin"]
         home_is_fav = row["ensemble_home_prob"] >= 50
 
         lr_h = row["lr_home_prob"]
         rf_h = row["rf_home_prob"]
         ens_h = row["ensemble_home_prob"]
         conf = row["confidence"]
+        spread = row["projected_spread"]
 
-        # --- יצירת תווית "התוצאה בפועל" ---
+        # --- actual result + score + spread accuracy ---
         result_html = ""
-        if actual != "Pending":
+        spread_result_html = ""
+        if actual != "Pending" and actual_margin is not None:
             is_correct = (winner == actual)
-            if is_correct:
-                result_html = f'<div class="actual-result correct">✅ <strong>Correct Prediction!</strong> Actual Winner: {actual}</div>'
+            result_html = (
+                f'<div class="actual-result correct">✅ <strong>Correct!</strong> '
+                f'{home} {actual_score} {away}</div>'
+                if is_correct else
+                f'<div class="actual-result incorrect">❌ <strong>Incorrect.</strong> '
+                f'{home} {actual_score} {away}</div>'
+            )
+            # Spread accuracy: compare predicted margin direction & magnitude
+            pred = float(raw_margin)
+            act = float(actual_margin)
+            # Determine favoured team name and margins from their perspective
+            if pred >= 0:
+                fav_name = home
+                pred_margin = abs(pred)
+                act_margin_fav = act          # positive = home won by that much
             else:
-                result_html = f'<div class="actual-result incorrect">❌ <strong>Incorrect.</strong> Actual Winner: {actual}</div>'
-        # ----------------------------------
+                fav_name = away
+                pred_margin = abs(pred)
+                act_margin_fav = -act         # positive = away won by that much
+
+            if act_margin_fav > pred_margin:
+                spread_result_html = (
+                    f'<div class="spread-result spread-more">'
+                    f'📈 {fav_name} won by <strong>{abs(act_margin_fav):.0f}</strong> '
+                    f'— more than predicted ({pred_margin:.1f})</div>'
+                )
+            elif act_margin_fav >= 0:
+                spread_result_html = (
+                    f'<div class="spread-result spread-less">'
+                    f'📉 {fav_name} won by <strong>{abs(act_margin_fav):.0f}</strong> '
+                    f'— less than predicted ({pred_margin:.1f})</div>'
+                )
+            else:
+                spread_result_html = (
+                    f'<div class="spread-result spread-upset">'
+                    f'🔄 Upset — {actual} won by <strong>{abs(act_margin_fav):.0f}</strong> '
+                    f'(predicted {fav_name} by {pred_margin:.1f})</div>'
+                )
+        # -----------------------------------------------
 
         cards_html += f"""
         <div class="card">
@@ -220,8 +408,13 @@ def build_html(predictions: pd.DataFrame, game_date: date) -> str:
                 <span class="pick-team">{winner}</span>
                 {_confidence_badge(conf)}
             </div>
-            
+            <div class="spread-row">
+                <span class="pick-label">Projected spread:</span>
+                <span class="spread-value">{spread}</span>
+            </div>
+
             {result_html}
+            {spread_result_html}
 
             <div class="models-section">
                 <div class="model-row">
@@ -327,6 +520,26 @@ def build_html(predictions: pd.DataFrame, game_date: date) -> str:
   }}
   .pick-label {{ color: #8b949e; font-size: 0.85rem; }}
   .pick-team {{ font-weight: 700; color: #58a6ff; font-size: 1rem; }}
+
+  .spread-row {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }}
+  .spread-value {{ font-weight: 600; color: #d29922; font-size: 0.95rem; }}
+
+  .spread-result {{
+    margin-top: 4px;
+    margin-bottom: 12px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+  }}
+  .spread-more  {{ background: rgba(35,134,54,0.1);   border: 1px solid #238636; color: #e6edf3; }}
+  .spread-less  {{ background: rgba(210,153,34,0.12); border: 1px solid #9e6a03; color: #e6edf3; }}
+  .spread-upset {{ background: rgba(139,148,158,0.1); border: 1px solid #484f58; color: #e6edf3; }}
 
   .actual-result {{
     margin-top: 4px;

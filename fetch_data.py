@@ -15,7 +15,7 @@ import time
 import argparse
 from datetime import date
 import pandas as pd
-from nba_api.stats.endpoints import leaguegamefinder
+from nba_api.stats.endpoints import leaguegamefinder, leaguegamelog
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -55,6 +55,7 @@ SEASONS = _build_seasons(num_seasons=6)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 GAMES_FILE = os.path.join(DATA_DIR, "games_raw.csv")
+PLAYER_LOGS_FILE = os.path.join(DATA_DIR, "player_game_logs.csv")
 
 # Seconds to wait between API calls to avoid rate-limiting
 API_SLEEP = 1.5
@@ -137,6 +138,81 @@ def update_with_new_games(existing_df: pd.DataFrame) -> pd.DataFrame:
     updated = pd.concat([existing_df, new_rows], ignore_index=True)
     updated.to_csv(GAMES_FILE, index=False)
     return updated
+
+
+# ── Player game logs ─────────────────────────────────────────────────────────
+
+def _parse_minutes(min_val) -> float:
+    """
+    Convert a minutes value to a float.
+    nba_api can return minutes as a 'MM:SS' string or as a float depending
+    on the endpoint version — this handles both.
+    """
+    if min_val is None or (isinstance(min_val, float) and pd.isna(min_val)):
+        return 0.0
+    s = str(min_val).strip()
+    if not s or s in ("None", "nan"):
+        return 0.0
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            return float(parts[0]) + float(parts[1]) / 60.0
+        except (ValueError, IndexError):
+            return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def fetch_player_game_logs(
+    seasons: list = SEASONS,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """
+    Fetch player-level game logs for all seasons using LeagueGameLog.
+    Cached to data/player_game_logs.csv — only re-fetched if force_refresh=True
+    or the file is missing.
+
+    Returns a DataFrame with columns:
+        PLAYER_ID, PLAYER_NAME, TEAM_ID, GAME_ID, GAME_DATE, SEASON, MIN_float
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    if os.path.exists(PLAYER_LOGS_FILE) and not force_refresh:
+        print(f"✓ Loading cached player game logs from {PLAYER_LOGS_FILE}")
+        df = pd.read_csv(PLAYER_LOGS_FILE)
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+        print(f"  {len(df):,} player-game rows across {df['SEASON'].nunique()} seasons.")
+        return df
+
+    print(f"Fetching player game logs for {len(seasons)} seasons from nba_api …")
+    dfs = []
+    for season in seasons:
+        print(f"  Fetching {season} …", flush=True)
+        log = leaguegamelog.LeagueGameLog(
+            season=season,
+            season_type_all_star="Regular Season",
+            player_or_team_abbreviation="P",
+            league_id="00",
+        )
+        df = log.get_data_frames()[0]
+        df["SEASON"] = season
+        dfs.append(df)
+        print(f"    ✓ {len(df):,} player-game rows")
+        time.sleep(API_SLEEP)
+
+    all_logs = pd.concat(dfs, ignore_index=True)
+    all_logs["GAME_DATE"] = pd.to_datetime(all_logs["GAME_DATE"])
+    all_logs["MIN_float"] = all_logs["MIN"].apply(_parse_minutes)
+
+    # Keep only the columns needed downstream — discard box-score stats
+    keep_cols = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "GAME_ID",
+                 "GAME_DATE", "SEASON", "MIN_float"]
+    all_logs = all_logs[[c for c in keep_cols if c in all_logs.columns]]
+    all_logs.to_csv(PLAYER_LOGS_FILE, index=False)
+    print(f"✓ Saved {len(all_logs):,} player-game rows to {PLAYER_LOGS_FILE}")
+    return all_logs
 
 
 # ── CLI entry-point ───────────────────────────────────────────────────────────
