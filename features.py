@@ -21,7 +21,7 @@ Each row in the output represents ONE game from the HOME team's perspective:
 
 Usage:
     from features import build_feature_matrix
-    X, y, weights = build_feature_matrix(raw_df)
+    X, y, weights, margins = build_feature_matrix(raw_df)
 """
 
 import numpy as np
@@ -65,7 +65,8 @@ KEY_PLAYER_MIN_THRESHOLD = 15.0
 KEY_PLAYER_MIN_GAMES = 30
 
 
-# Map season string → numeric recency weight (oldest = 1, newest = 6)
+# Map season string → exponential recency weight (oldest = 1, newest = 32)
+# Pattern: [1, 2, 4, 8, 16, 32] — each season is weighted 2× the one before it
 def _build_season_weights(num_seasons: int = 6) -> dict:
     from datetime import date
     today = date.today()
@@ -77,7 +78,7 @@ def _build_season_weights(num_seasons: int = 6) -> dict:
     for i in range(num_seasons - 1, -1, -1):
         start = end_year - i
         season = f"{start}-{str(start + 1)[-2:]}"
-        weights[season] = num_seasons - i
+        weights[season] = 2 ** (num_seasons - 1 - i)
     return weights
 
 SEASON_WEIGHTS = _build_season_weights(num_seasons=6)
@@ -349,7 +350,6 @@ def build_prediction_row(
     hist_df = historical_df.copy()
     hist_df["GAME_DATE"] = pd.to_datetime(hist_df["GAME_DATE"]).dt.normalize()
     hist_df["WL_binary"] = (hist_df["WL"] == "W").astype(int)
-    # חשוב: נוסיף פה את סמן משחקי הבית כדי שנוכל לסנן לפיו
     hist_df["is_home"] = hist_df["MATCHUP"].str.contains(r"vs\.", regex=True).astype(int)
 
     # ── Home team stats ───────────────────────────────────────────────────────
@@ -358,8 +358,8 @@ def build_prediction_row(
 
     home_season = home_hist["SEASON"].max() if len(home_hist) > 0 else None
     
-    # חישוב אחוז ניצחונות ספציפית בבית העונה (with the same +4W/+4L prior
-    # used in build_feature_matrix, so training and prediction match)
+    # Home win% at home this season, using the same +4W/+4L prior as
+    # build_feature_matrix so training and prediction are consistent.
     home_hist_at_home = home_hist[home_hist["is_home"] == 1]
     home_season_games_at_home = home_hist_at_home[home_hist_at_home["SEASON"] == home_season]
     home_wins_at_home = float(home_season_games_at_home["WL_binary"].sum())
@@ -381,7 +381,7 @@ def build_prediction_row(
 
     away_season = away_hist["SEASON"].max() if len(away_hist) > 0 else None
     
-    # חישוב אחוז ניצחונות ספציפית בחוץ העונה (same +4W/+4L prior as above)
+    # Away win% on the road this season (same +4W/+4L prior as above).
     away_hist_on_road = away_hist[away_hist["is_home"] == 0]
     away_season_games_on_road = away_hist_on_road[away_hist_on_road["SEASON"] == away_season]
     away_wins_on_road = float(away_season_games_on_road["WL_binary"].sum())
