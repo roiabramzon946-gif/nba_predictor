@@ -292,7 +292,7 @@ def build_feature_matrix(
         "PTS": "away_pts",
     })
 
-    paired = home.merge(away, on="GAME_ID").sort_values("GAME_DATE").reset_index(drop=True)
+    paired = home.merge(away, on="GAME_ID").sort_values(["GAME_DATE", "GAME_ID"]).reset_index(drop=True)
     paired = paired[paired["home_win"] + paired["away_win"] == 1].copy()
 
     paired["home_h2h"] = _h2h_win_rate(paired)
