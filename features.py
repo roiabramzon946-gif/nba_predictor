@@ -65,8 +65,8 @@ KEY_PLAYER_MIN_THRESHOLD = 15.0
 KEY_PLAYER_MIN_GAMES = 30
 
 
-# Map season string → exponential recency weight (oldest = 1, newest = 32)
-# Pattern: [1, 2, 4, 8, 16, 32] — each season is weighted 2× the one before it
+# Map season string → exponential recency weight (oldest = 1, newest = 243)
+# Pattern: [1, 3, 9, 27, 81, 243] — each season is weighted 3× the one before it
 def _build_season_weights(num_seasons: int = 6) -> dict:
     from datetime import date
     today = date.today()
@@ -78,7 +78,7 @@ def _build_season_weights(num_seasons: int = 6) -> dict:
     for i in range(num_seasons - 1, -1, -1):
         start = end_year - i
         season = f"{start}-{str(start + 1)[-2:]}"
-        weights[season] = 2 ** (num_seasons - 1 - i)
+        weights[season] = 3 ** (num_seasons - 1 - i)
     return weights
 
 SEASON_WEIGHTS = _build_season_weights(num_seasons=6)

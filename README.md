@@ -24,7 +24,7 @@ Predicts the winner and point spread of every NBA regular-season game using a Lo
 
 **Bayesian smoothing**: Every team starts the season with a +4W / +4L prior so early-season win% doesn't spike to 0% or 100% after 1–2 games.
 
-**Recency weights**: `[1, 2, 4, 8, 16, 32]` — the current season has 32× the influence of the oldest season. Each season back is half as influential as the one before it.
+**Recency weights**: `[1, 3, 9, 27, 81, 243]` — the current season has 243× the influence of the oldest season. Each season back is one third as influential as the one before it.
 
 **Injury feature**: A player counts as a "key" player if they averaged ≥ 15 min/game over ≥ 30 games for their team that season. Their absence is only tracked from the game they first joined the team (prevents mid-season trade arrivals from generating false "missing" signals).
 
